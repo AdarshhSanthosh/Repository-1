@@ -6,15 +6,19 @@ from pinecone import Pinecone, ServerlessSpec
 from langchain_community.vectorstores import Pinecone as VectorStorePinecone
 from langchain_community.chat_models import ChatOpenAI
 from langchain.agents import Tool, create_react_agent, AgentExecutor
-from langchain.tools import DuckDuckGoSearchResults
+from langchain_community.tools import DuckDuckGoSearchResults
 from langchain.prompts import PromptTemplate
+from langchain.memory import ConversationBufferMemory
 import gradio as gr
 from dotenv import load_dotenv
 import os
+import re
+
 # Load environment variables
 load_dotenv()
+PINECONE_API_KEY = os.getenv("PINECONE_API")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-PINECONE_API_KEY="pcsk_5ghur7_3N246zk7wLTQKGC2vHFsPBZNSCsApzAbqJujv3BwSN2ucueVpfr3VP3wecuCecB"
+
 PINECONE_ENV = os.getenv("PINECONE_ENV")  # Add environment variable for Pinecone environment
 
 # Configuration constants
@@ -26,7 +30,7 @@ embeddings_model = OpenAIEmbeddings(model="text-embedding-ada-002")
 # Initialize Pinecone client and index
 pc = Pinecone(api_key=PINECONE_API_KEY)
 
-index_name = "example-index2"
+index_name = "example-index3"
 if index_name not in pc.list_indexes().names():
     pc.create_index(
         name=index_name,
@@ -34,7 +38,7 @@ if index_name not in pc.list_indexes().names():
         metric="cosine",
         spec=ServerlessSpec(
             cloud="aws",
-            region=PINECONE_ENV
+            region=us-east-1
         )
     )
 
@@ -68,7 +72,15 @@ def retrieve_relevant_chunks(query):
     # Extract metadata for relevant documents
     return results["matches"]
 
-# Step 6: Initialize the ChatOpenAI model
+def is_realtime_query(query):
+    # Define patterns for detecting real-time or time-sensitive queries
+    time_sensitive_keywords = ["today", "latest", "current", "now", "2024", "2025"]
+    time_sensitive_patterns = r"|".join(time_sensitive_keywords)
+    
+    # Check if query matches any of the patterns
+    return bool(re.search(time_sensitive_patterns, query, re.IGNORECASE))
+
+# Step 5: Initialize the ChatOpenAI model
 llm = ChatOpenAI(temperature=0.5, model="gpt-4o-mini")
 
 # Step 6: Set up the DuckDuckGo search tool
@@ -79,11 +91,29 @@ search_tool = Tool(
     func=search.run,
 )
 
-# Prepare tools for the agent
-tools = [search_tool]
+# Step 7: Set up the Pinecone DB tool
+def pinecone_db_tool(query):
+    matches = retrieve_relevant_chunks(query)
+    knowledge = ""
+    for match in matches:
+        if "metadata" in match and "text" in match["metadata"]:
+            knowledge += match["metadata"]["text"] + "\n\n"
+    return knowledge
 
-# Create ReAct agent for general queries
-react_template = """Answer the following questions as best you can. You have access to the following tools:
+pinecone_tool = Tool(
+    name="pinecone_db",
+    description="A tool to retrieve relevant information from local documents stored in Pinecone.",
+    func=pinecone_db_tool,
+)
+
+# Prepare tools for the agent
+tools = [pinecone_tool, search_tool]  # Prioritize Pinecone tool over search tool
+
+# Step 8: Set up memory for the conversation
+memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+
+# Step 9: Create ReAct agent for general queries
+react_template = """Answer the following questions as best you can. You have access to the following tools when i ask a question, first you should check it on the pinecone database.you should also keep the history of chats. and when i ask like "what was my n'th question you should reply." :
 
 {tools}
 
@@ -110,48 +140,47 @@ prompt = PromptTemplate(
 
 agent = create_react_agent(llm, tools, prompt)
 agent_executor = AgentExecutor(
-    agent=agent, tools=tools, verbose=True, handle_parsing_errors=True
+    agent=agent, tools=tools, verbose=True, handle_parsing_errors=True, memory=memory
 )
 
-# Step 7: Define response streaming function
+# Step 10: Define response streaming function
 def stream_response(message, history):
     try:
-        # Attempt to retrieve relevant chunks from Pinecone
-        matches = retrieve_relevant_chunks(message)
+        # Load the chat history from memory
+        chat_history = memory.load_memory_variables({})["chat_history"]
 
-        # Combine retrieved chunks into a knowledge base
-        knowledge = ""
-        for match in matches:
-            if "metadata" in match and "text" in match["metadata"]:
-                knowledge += match["metadata"]["text"] + "\n\n"
-
-        if not knowledge.strip():  # If no knowledge is found, use the search tool
-            response = agent_executor.invoke({"input": message})
-            yield response.get("output", "No response from search tool.")
+        # Check if the user is asking about their name
+        if "what is my name" in message.lower():
+            # Retrieve the user's name from memory
+            for msg in chat_history:
+                if "my name is" in msg.content.lower():
+                    name = msg.content.split("my name is")[1].strip()
+                    yield f"Your name is {name}."
+                    return
+            yield "I don't know your name yet. Please tell me your name."
             return
 
-        # Construct the RAG prompt if knowledge is found
-        rag_prompt = f"""
-        You are a highly knowledgeable and helpful assistant.
-        Your role is to answer questions and assist with tasks to the best of your ability,
-        using your internal knowledge and reasoning skills.
-        Provide clear, accurate, and concise responses tailored to the user's queries.
-        Feel free to ask clarifying questions if needed to provide the best assistance.
+        # Check if the user is asking about their first question
+        if "what was my first question" in message.lower():
+            if len(chat_history) > 0:
+                first_question = chat_history[0].content
+                yield f"Your first question was: {first_question}"
+            else:
+                yield "You haven't asked any questions yet."
+            return
 
-        Knowledge base: {knowledge}
+        # Use the agent executor to handle the query
+        response = agent_executor.invoke({"input": message})
+        
+        # Update the memory with the new interaction
+        memory.save_context({"input": message}, {"output": response.get("output", "No response from the agent.")})
+        
+        # Yield the response
+        yield response.get("output", "No response from the agent.")
 
-        The question: {message}
-        """
-
-        # Stream the response to the Gradio app
-        partial_message = ""
-        for response in llm.stream(rag_prompt):
-            partial_message += response.content
-            yield partial_message
     except Exception as e:
         yield f"An error occurred: {str(e)}"
-
-# Step 8: Create the Gradio chatbot interface
+# Step 11: Create the Gradio chatbot interface
 chatbot = gr.ChatInterface(
     fn=stream_response,
     textbox=gr.Textbox(
@@ -162,5 +191,5 @@ chatbot = gr.ChatInterface(
     ),
 )
 
-# Step 9: Launch the chatbot
+# Step 12: Launch the chatbot
 chatbot.launch(share=True)  # Set share=True for public link
